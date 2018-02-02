@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/param.h>
 
 #include "sparkey.h"
 #include "sparkey-internal.h"
@@ -172,15 +173,23 @@ static sparkey_returncode hash_put(uint64_t wanted_slot, uint64_t hash, uint8_t 
 
   uint64_t displacement = 0;
   uint64_t slot = wanted_slot;
+  uint64_t loops = 0;
 
   int might_be_collision = iter != NULL && ra_iter != NULL && log != NULL;
   while (1) {
     uint64_t hash2 = hash_header->hash_algorithm.read_hash(hashtable, pos);
     uint64_t position2 = read_addr(hashtable, pos + hash_header->hash_size, hash_header->address_size);
+
     if (position2 == 0) {
       hash_header->hash_algorithm.write_hash(&hashtable[pos], hash);
       write_addr(&hashtable[pos + hash_header->hash_size], position, hash_header->address_size);
       added_entry(hash_header);
+
+      if (displacement > 0) {
+        hash_header->max_displacement = MAX(displacement, hash_header->max_displacement);
+        hash_header->total_displacement += displacement;
+      }
+
       return SPARKEY_SUCCESS;
     }
 
@@ -205,9 +214,18 @@ static sparkey_returncode hash_put(uint64_t wanted_slot, uint64_t hash, uint8_t 
           hash_header->hash_algorithm.write_hash(&hashtable[pos], hash);
           write_addr(&hashtable[pos + hash_header->hash_size], position, hash_header->address_size);
           replaced_entry(hash_header, keylen2, valuelen2);
+
+          if (displacement > 0) {
+            hash_header->max_displacement = MAX(displacement, hash_header->max_displacement);
+            hash_header->total_displacement += displacement;
+          }
+
           return SPARKEY_SUCCESS;
         }
       }
+
+      /* Count the collision */
+      hash_header->hash_collisions++;
     }
 
     uint64_t other_displacement = get_displacement(hash_header->hash_capacity, slot, hash2);
@@ -226,61 +244,16 @@ static sparkey_returncode hash_put(uint64_t wanted_slot, uint64_t hash, uint8_t 
     if (slot >= hash_header->hash_capacity) {
       pos = 0;
       slot = 0;
+      loops++;
+
+      if (loops > 1) {
+        fprintf(stderr, "hash_put():%d bug: ran out of hash capacity\n", __LINE__);
+        return SPARKEY_INTERNAL_ERROR;
+      }
     }
   }
   fprintf(stderr, "hash_put():%d bug: unreachable statement\n", __LINE__);
   return SPARKEY_INTERNAL_ERROR;
-}
-
-static void calculate_max_displacement(sparkey_hashheader *hash_header, uint8_t *hashtable) {
-  uint64_t capacity = hash_header->hash_capacity;
-  int hash_size = hash_header->hash_size;
-  int slot_size = hash_header->address_size + hash_size;
-
-  uint64_t max_displacement = 0;
-  uint64_t num_hash_collisions = 0;
-  uint64_t total_displacement = 0;
-
-  int has_first = 0;
-  uint64_t first_hash = 0;
-
-  int has_last = 0;
-  uint64_t last_hash = 0;
-
-  int has_prev = 0;
-  uint64_t prev_hash = -1;
-  for (uint64_t slot = 0; slot < capacity; slot++) {
-    uint64_t hash = hash_header->hash_algorithm.read_hash(hashtable, slot * slot_size);
-    if (has_prev && prev_hash == hash) {
-      num_hash_collisions++;
-    }
-    uint64_t position = read_addr(hashtable, slot * slot_size + hash_size, hash_header->address_size);
-    if (position != 0) {
-      prev_hash = hash;
-      has_prev = 1;
-      uint64_t displacement = get_displacement(capacity, slot, hash);
-      total_displacement += displacement;
-      if (displacement > max_displacement) {
-        max_displacement = displacement;
-      }
-      if (slot == 0) {
-        first_hash = hash;
-        has_first = 1;
-      }
-      if (slot == capacity - 1) {
-        last_hash = hash;
-        has_last = 1;
-      }
-    } else {
-      has_prev = 0;
-    }
-  }
-  if (has_first && has_last && first_hash == last_hash) {
-    num_hash_collisions++;
-  }
-  hash_header->total_displacement = total_displacement;
-  hash_header->max_displacement = max_displacement;
-  hash_header->hash_collisions = num_hash_collisions;
 }
 
 static sparkey_returncode read_fully(int fd, uint8_t *buf, size_t count) {
@@ -395,6 +368,11 @@ sparkey_returncode sparkey_hash_write(const char *hash_filename, const char *log
 
   hash_header.hash_capacity = 1 | (uint64_t) cap;
 
+  // Calculated during hash_put() calls
+  hash_header.total_displacement = 0;
+  hash_header.max_displacement = 0;
+  hash_header.hash_collisions = 0;
+
   hash_header.hash_seed = hash_seed;
   hash_header.max_key_len = log_header.max_key_len;
   hash_header.max_value_len = log_header.max_value_len;
@@ -483,8 +461,6 @@ sparkey_returncode sparkey_hash_write(const char *hash_filename, const char *log
     }
   }
 normal_exit:
-
-  calculate_max_displacement(&hash_header, hashtable);
 
   // Try removing it first, to avoid overwriting existing files that readers may be using.
   if (remove(hash_filename) < 0) {
